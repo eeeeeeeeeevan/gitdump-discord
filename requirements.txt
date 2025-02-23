@@ -3,3 +3,4 @@ requests
 beautifulsoup4
 dulwich
 requests-pkcs12
+discord.py==2.4.0
