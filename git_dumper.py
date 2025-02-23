@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
-from contextlib import closing
 import argparse
+import asyncio
+import logging
 import multiprocessing
 import os
-import os.path
 import re
+import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import traceback
 import urllib.parse
+import zipfile
+
+import discord
+from discord.ext import commands
 
 import urllib3
-
 import bs4
 import dulwich.index
 import dulwich.objects
@@ -22,96 +27,74 @@ import socks
 from requests_pkcs12 import Pkcs12Adapter
 
 
-def printf(fmt, *args, file=sys.stdout):
-    if args:
-        fmt = fmt % args
+logger = logging.getLogger("gitdumpdiscord")
+logger.setLevel(logging.DEBUG)
+handler = logging.StreamHandler(sys.stdout)
+formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+handler.setFormatter(formatter)
+logger.addHandler(handler)
 
-    file.write(fmt)
-    file.flush()
 
+def join_url(base, path):
+    """Safely join a base URL with a relative path."""
+    if not base.endswith("/"):
+        base += "/"
+    return urllib.parse.urljoin(base, path)
 
 def is_html(response):
-    """ Return True if the response is a HTML webpage """
-    return (
-        "Content-Type" in response.headers
-        and "text/html" in response.headers["Content-Type"]
-    )
-
+    """Return True if the response is an HTML webpage."""
+    return ("Content-Type" in response.headers and
+            "text/html" in response.headers["Content-Type"])
 
 def is_safe_path(path):
-    """ Prevent directory traversal attacks """
-    if path.startswith("/"):
+    """Prevent directory traversal attacks."""
+    if os.path.isabs(path):
         return False
-
     safe_path = os.path.expanduser("~")
-    return (
-        os.path.commonpath(
-            (os.path.realpath(os.path.join(safe_path, path)), safe_path)
-        )
-        == safe_path
-    )
-
+    try:
+        full_path = os.path.realpath(os.path.join(safe_path, path))
+    except Exception:
+        return False
+    return os.path.commonpath((full_path, safe_path)) == safe_path
 
 def get_indexed_files(response):
-    """ Return all the files in the directory index webpage """
+    """Return all file paths listed in a directory index HTML page."""
     html = bs4.BeautifulSoup(response.text, "html.parser")
     files = []
-
     for link in html.find_all("a"):
-        url = urllib.parse.urlparse(link.get("href"))
-
-        if (
-            url.path
-            and is_safe_path(url.path)
-            and not url.scheme
-            and not url.netloc
-        ):
+        href = link.get("href")
+        if not href:
+            continue
+        url = urllib.parse.urlparse(href)
+        if url.path and is_safe_path(url.path) and not url.scheme and not url.netloc:
             files.append(url.path)
-
     return files
-
 
 def verify_response(response):
     if response.status_code != 200:
-        return (
-            False,
-            "[-] %s/%s responded with status code {code}\n".format(
-                code=response.status_code
-            ),
-        )
-    elif (
-        "Content-Length" in response.headers
-        and response.headers["Content-Length"] == 0
-    ):
-        return False, "[-] %s/%s responded with a zero-length body\n"
-    elif (
-        "Content-Type" in response.headers
-        and "text/html" in response.headers["Content-Type"]
-    ):
-        return False, "[-] %s/%s responded with HTML\n"
+        return (False,
+                "[-] {} responded with status code {}\n".format(response.request.url, response.status_code))
+    elif ("Content-Length" in response.headers and int(response.headers["Content-Length"]) == 0):
+        return False, "[-] {} responded with a zero-length body\n".format(response.request.url)
+    elif ("Content-Type" in response.headers and "text/html" in response.headers["Content-Type"]):
+        return False, "[-] {} responded with HTML\n".format(response.request.url)
     else:
         return True, True
 
-
 def create_intermediate_dirs(path):
-    """ Create intermediate directories, if necessary """
-
-    dirname, basename = os.path.split(path)
-
+    """Create intermediate directories if they do not exist."""
+    dirname = os.path.dirname(path)
     if dirname and not os.path.exists(dirname):
         try:
             os.makedirs(dirname)
         except FileExistsError:
             pass  # race condition
 
-
 def get_referenced_sha1(obj_file):
-    """ Return all the referenced SHA1 in the given object file """
+    """Return all referenced SHA1 hashes in the given git object."""
     objs = []
-
     if isinstance(obj_file, dulwich.objects.Commit):
         objs.append(obj_file.tree.decode())
-
         for parent in obj_file.parents:
             objs.append(parent.decode())
     elif isinstance(obj_file, dulwich.objects.Tree):
@@ -122,17 +105,12 @@ def get_referenced_sha1(obj_file):
     elif isinstance(obj_file, dulwich.objects.Tag):
         pass
     else:
-        printf(
-            "error: unexpected object type: %r\n" % obj_file, file=sys.stderr
-        )
-        sys.exit(1)
-
+        logger.error("Unexpected object type: %r", obj_file)
+        return []
     return objs
 
-
+# Worker classes for multiprocessing tasks.
 class Worker(multiprocessing.Process):
-    """ Worker for process_tasks """
-
     def __init__(self, pending_tasks, tasks_done, args):
         super().__init__()
         self.daemon = True
@@ -141,27 +119,19 @@ class Worker(multiprocessing.Process):
         self.args = args
 
     def run(self):
-        # initialize process
         self.init(*self.args)
-
-        # fetch and do tasks
         while True:
             task = self.pending_tasks.get(block=True)
-
-            if task is None:  # end signal
+            if task is None:
                 return
-
             try:
                 result = self.do_task(task, *self.args)
             except Exception:
-                printf("Task %s raised exception:\n", task, file=sys.stderr)
-                traceback.print_exc()
+                logger.exception("Task %s raised exception", task)
                 result = []
-
-            assert isinstance(
-                result, list
-            ), "do_task() should return a list of tasks"
-
+            if not isinstance(result, list):
+                logger.error("do_task() should return a list")
+                result = []
             self.tasks_done.put(result)
 
     def init(self, *args):
@@ -170,334 +140,251 @@ class Worker(multiprocessing.Process):
     def do_task(self, task, *args):
         raise NotImplementedError
 
-
-def process_tasks(initial_tasks, worker, jobs, args=(), tasks_done=None):
-    """ Process tasks in parallel """
-
+def process_tasks(initial_tasks, worker, jobs, args=(), tasks_done_set=None):
     if not initial_tasks:
         return
-
-    tasks_seen = set(tasks_done) if tasks_done else set()
+    tasks_seen = set(tasks_done_set) if tasks_done_set else set()
     pending_tasks = multiprocessing.Queue()
     tasks_done = multiprocessing.Queue()
     num_pending_tasks = 0
-
-    # add all initial tasks in the queue
     for task in initial_tasks:
-        assert task is not None
-
         if task not in tasks_seen:
             pending_tasks.put(task)
             num_pending_tasks += 1
             tasks_seen.add(task)
-
-    # initialize processes
     processes = [worker(pending_tasks, tasks_done, args) for _ in range(jobs)]
-
-    # launch them all
     for p in processes:
         p.start()
-
-    # collect task results
     while num_pending_tasks > 0:
         task_result = tasks_done.get(block=True)
         num_pending_tasks -= 1
-
         for task in task_result:
-            assert task is not None
-
             if task not in tasks_seen:
                 pending_tasks.put(task)
                 num_pending_tasks += 1
                 tasks_seen.add(task)
-
-    # send termination signal (task=None)
     for _ in range(jobs):
         pending_tasks.put(None)
-
-    # join all
     for p in processes:
         p.join()
 
-
 class DownloadWorker(Worker):
-    """ Download a list of files """
-
     def init(self, url, directory, retry, timeout, http_headers, client_cert_p12=None, client_cert_p12_password=None):
         self.session = requests.Session()
         self.session.verify = False
         self.session.headers = http_headers
         if client_cert_p12:
-            self.session.mount(url, Pkcs12Adapter(pkcs12_filename=client_cert_p12, pkcs12_password=client_cert_p12_password))
+            self.session.mount(url, Pkcs12Adapter(pkcs12_filename=client_cert_p12,
+                                                   pkcs12_password=client_cert_p12_password))
         else:
             self.session.mount(url, requests.adapters.HTTPAdapter(max_retries=retry))
 
     def do_task(self, filepath, url, directory, retry, timeout, http_headers, client_cert_p12=None, client_cert_p12_password=None):
-        if os.path.isfile(os.path.join(directory, filepath)):
-            printf("[-] Already downloaded %s/%s\n", url, filepath)
+        local_path = os.path.join(directory, filepath)
+        if os.path.isfile(local_path):
+            logger.info("[-] Already downloaded %s", join_url(url, filepath))
             return []
-
-        with closing(
-            self.session.get(
-                "%s/%s" % (url, filepath),
-                allow_redirects=False,
-                stream=True,
-                timeout=timeout,
-            )
-        ) as response:
-            printf(
-                "[-] Fetching %s/%s [%d]\n",
-                url,
-                filepath,
-                response.status_code,
-            )
-
-            valid, error_message = verify_response(response)
-            if not valid:
-                printf(error_message, url, filepath, file=sys.stderr)
-                return []
-
-            abspath = os.path.abspath(os.path.join(directory, filepath))
-            create_intermediate_dirs(abspath)
-
-            # write file
-            with open(abspath, "wb") as f:
-                for chunk in response.iter_content(4096):
-                    f.write(chunk)
-
-            return []
-
-
-class RecursiveDownloadWorker(DownloadWorker):
-    """ Download a directory recursively """
-
-    def do_task(self, filepath, url, directory, retry, timeout, http_headers):
-        if os.path.isfile(os.path.join(directory, filepath)):
-            printf("[-] Already downloaded %s/%s\n", url, filepath)
-            return []
-
-        with closing(
-            self.session.get(
-                "%s/%s" % (url, filepath),
-                allow_redirects=False,
-                stream=True,
-                timeout=timeout,
-            )
-        ) as response:
-            printf(
-                "[-] Fetching %s/%s [%d]\n",
-                url,
-                filepath,
-                response.status_code,
-            )
-
-            if (
-                response.status_code in (301, 302)
-                and "Location" in response.headers
-                and response.headers["Location"].endswith(filepath + "/")
-            ):
-                return [filepath + "/"]
-
-            if filepath.endswith("/"):  # directory index
-                assert is_html(response)
-
-                return [
-                    filepath + filename
-                    for filename in get_indexed_files(response)
-                ]
-            else:  # file
+        full_url = join_url(url, filepath)
+        try:
+            with self.session.get(full_url, allow_redirects=False, stream=True, timeout=timeout) as response:
+                logger.info("[-] Fetching %s [%d]", full_url, response.status_code)
                 valid, error_message = verify_response(response)
                 if not valid:
-                    printf(error_message, url, filepath, file=sys.stderr)
+                    logger.error(error_message)
                     return []
-
-                abspath = os.path.abspath(os.path.join(directory, filepath))
-                create_intermediate_dirs(abspath)
-
-                # write file
-                with open(abspath, "wb") as f:
+                abs_path = os.path.abspath(local_path)
+                create_intermediate_dirs(abs_path)
+                with open(abs_path, "wb") as f:
                     for chunk in response.iter_content(4096):
                         f.write(chunk)
+        except Exception:
+            logger.exception("Error fetching %s", full_url)
+        return []
 
-                return []
-
+class RecursiveDownloadWorker(DownloadWorker):
+    def do_task(self, filepath, url, directory, retry, timeout, http_headers):
+        local_path = os.path.join(directory, filepath)
+        if os.path.isfile(local_path):
+            logger.info("[-] Already downloaded %s", join_url(url, filepath))
+            return []
+        full_url = join_url(url, filepath)
+        try:
+            with self.session.get(full_url, allow_redirects=False, stream=True, timeout=timeout) as response:
+                logger.info("[-] Fetching %s [%d]", full_url, response.status_code)
+                if (response.status_code in (301, 302) and "Location" in response.headers and 
+                    response.headers["Location"].endswith(filepath + "/")):
+                    return [filepath + "/"]
+                if filepath.endswith("/"):
+                    if not is_html(response):
+                        logger.error("[-] %s did not return a valid HTML directory listing", full_url)
+                        return []
+                    return [filepath + filename for filename in get_indexed_files(response)]
+                else:
+                    valid, error_message = verify_response(response)
+                    if not valid:
+                        logger.error(error_message)
+                        return []
+                    abs_path = os.path.abspath(local_path)
+                    create_intermediate_dirs(abs_path)
+                    with open(abs_path, "wb") as f:
+                        for chunk in response.iter_content(4096):
+                            f.write(chunk)
+        except Exception:
+            logger.exception("Error fetching %s", full_url)
+        return []
 
 class FindRefsWorker(DownloadWorker):
-    """ Find refs/ """
-
     def do_task(self, filepath, url, directory, retry, timeout, http_headers, client_cert_p12=None, client_cert_p12_password=None):
-        response = self.session.get(
-            "%s/%s" % (url, filepath), allow_redirects=False, timeout=timeout
-        )
-        printf(
-            "[-] Fetching %s/%s [%d]\n", url, filepath, response.status_code
-        )
-
-        valid, error_message = verify_response(response)
-        if not valid:
-            printf(error_message, url, filepath, file=sys.stderr)
-            return []
-
-        abspath = os.path.abspath(os.path.join(directory, filepath))
-        create_intermediate_dirs(abspath)
-
-        # write file
-        with open(abspath, "w") as f:
-            f.write(response.text)
-
-        # find refs
-        tasks = []
-
-        for ref in re.findall(
-            r"(refs(/[a-zA-Z0-9\-\.\_\*]+)+)", response.text
-        ):
-            ref = ref[0]
-            if not ref.endswith("*") and is_safe_path(ref):
-                tasks.append(".git/%s" % ref)
-                tasks.append(".git/logs/%s" % ref)
-
-        return tasks
-
-
-class FindObjectsWorker(DownloadWorker):
-    """ Find objects """
-
-    def do_task(self, obj, url, directory, retry, timeout, http_headers, client_cert_p12=None, client_cert_p12_password=None):
-        filepath = ".git/objects/%s/%s" % (obj[:2], obj[2:])
-
-        if os.path.isfile(os.path.join(directory, filepath)):
-            printf("[-] Already downloaded %s/%s\n", url, filepath)
-        else:
-            response = self.session.get(
-                "%s/%s" % (url, filepath),
-                allow_redirects=False,
-                timeout=timeout,
-            )
-            printf(
-                "[-] Fetching %s/%s [%d]\n",
-                url,
-                filepath,
-                response.status_code,
-            )
-
+        full_url = join_url(url, filepath)
+        try:
+            response = self.session.get(full_url, allow_redirects=False, timeout=timeout)
+            logger.info("[-] Fetching %s [%d]", full_url, response.status_code)
             valid, error_message = verify_response(response)
             if not valid:
-                printf(error_message, url, filepath, file=sys.stderr)
+                logger.error(error_message)
                 return []
+            abs_path = os.path.abspath(os.path.join(directory, filepath))
+            create_intermediate_dirs(abs_path)
+            with open(abs_path, "w") as f:
+                f.write(response.text)
+            tasks = []
+            for ref in re.findall(r"(refs(/[a-zA-Z0-9\-\.\_\*]+)+)", response.text):
+                ref_str = ref[0]
+                if not ref_str.endswith("*") and is_safe_path(ref_str):
+                    tasks.append(".git/" + ref_str)
+                    tasks.append(".git/logs/" + ref_str)
+            return tasks
+        except Exception:
+            logger.exception("Error processing refs from %s", full_url)
+            return []
 
-            abspath = os.path.abspath(os.path.join(directory, filepath))
-            create_intermediate_dirs(abspath)
-
-            # write file
-            with open(abspath, "wb") as f:
-                f.write(response.content)
-
-        abspath = os.path.abspath(os.path.join(directory, filepath))
-        # parse object file to find other objects
-        obj_file = dulwich.objects.ShaFile.from_path(abspath)
-        return get_referenced_sha1(obj_file)
-
+class FindObjectsWorker(DownloadWorker):
+    def do_task(self, obj, url, directory, retry, timeout, http_headers, client_cert_p12=None, client_cert_p12_password=None):
+        filepath = ".git/objects/{}/{}".format(obj[:2], obj[2:])
+        local_path = os.path.join(directory, filepath)
+        full_url = join_url(url, filepath)
+        if os.path.isfile(local_path):
+            logger.info("[-] Already downloaded %s", full_url)
+        else:
+            try:
+                response = self.session.get(full_url, allow_redirects=False, timeout=timeout)
+                logger.info("[-] Fetching %s [%d]", full_url, response.status_code)
+                valid, error_message = verify_response(response)
+                if not valid:
+                    logger.error(error_message)
+                    return []
+                abs_path = os.path.abspath(local_path)
+                create_intermediate_dirs(abs_path)
+                with open(abs_path, "wb") as f:
+                    f.write(response.content)
+            except Exception:
+                logger.exception("Error fetching %s", full_url)
+                return []
+        try:
+            obj_file = dulwich.objects.ShaFile.from_path(os.path.abspath(local_path))
+            return get_referenced_sha1(obj_file)
+        except Exception:
+            logger.exception("Error parsing object file %s", local_path)
+            return []
 
 def sanitize_file(filepath):
-    """ Inplace comment out possibly unsafe lines based on regex """
-    assert os.path.isfile(filepath), "%s is not a file" % filepath
+    """In-place comment out possibly unsafe lines based on regex."""
+    if not os.path.isfile(filepath):
+        logger.error("File %s does not exist", filepath)
+        return
+    UNSAFE = r"^\s*fsmonitor|sshcommand|askpass|editor|pager"
+    try:
+        with open(filepath, 'r+') as f:
+            content = f.read()
+            modified_content = re.sub(UNSAFE, r'# \g<0>', content, flags=re.IGNORECASE)
+            if content != modified_content:
+                logger.warning("Warning: '%s' file was altered", filepath)
+                f.seek(0)
+                f.write(modified_content)
+                f.truncate()
+    except Exception:
+        logger.exception("Error sanitizing file %s", filepath)
 
-    UNSAFE=r"^\s*fsmonitor|sshcommand|askpass|editor|pager"
-
-    with open(filepath, 'r+') as f:
-        content = f.read()
-        modified_content = re.sub(UNSAFE, '# \g<0>', content, flags=re.IGNORECASE)
-        if content != modified_content:
-            printf("Warning: '%s' file was altered\n" % filepath)
-            f.seek(0)
-            f.write(modified_content)
-
-
-def fetch_git(url, directory, jobs, retry, timeout, http_headers, client_cert_p12=None, client_cert_p12_password=None):
-    """ Dump a git repository into the output directory """
-
-    assert os.path.isdir(directory), "%s is not a directory" % directory
-    assert jobs >= 1, "invalid number of jobs"
-    assert retry >= 1, "invalid number of retries"
-    assert timeout >= 1, "invalid timeout"
+def fetch_git(url, directory, jobs, retry, timeout, http_headers,
+              client_cert_p12=None, client_cert_p12_password=None):
+    """
+    Dump a git repository from the given website into the output directory.
+    Instead of changing the working directory globally, we pass the output directory
+    to subprocess calls.
+    """
+    if not os.path.isdir(directory):
+        logger.error("Destination %s is not a directory", directory)
+        return 1
 
     session = requests.Session()
     session.verify = False
     session.headers = http_headers
     if client_cert_p12:
-        session.mount(url, Pkcs12Adapter(pkcs12_filename=client_cert_p12, pkcs12_password=client_cert_p12_password))
+        session.mount(url, Pkcs12Adapter(pkcs12_filename=client_cert_p12,
+                                           pkcs12_password=client_cert_p12_password))
     else:
         session.mount(url, requests.adapters.HTTPAdapter(max_retries=retry))
-    if os.listdir(directory):
-        printf("Warning: Destination '%s' is not empty\n", directory)
 
-    # find base url
-    url = url.rstrip("/")
-    if url.endswith("HEAD"):
-        url = url[:-4]
+    if os.listdir(directory):
+        logger.warning("Warning: Destination '%s' is not empty", directory)
+
     url = url.rstrip("/")
     if url.endswith(".git"):
         url = url[:-4]
     url = url.rstrip("/")
 
-    # check for /.git/HEAD
-    printf("[-] Testing %s/.git/HEAD ", url)
-    response = session.get(
-        "%s/.git/HEAD" % url, 
-        timeout=timeout, 
-        allow_redirects=False
-    )
-    printf("[%d]\n", response.status_code)
-
+    head_url = join_url(url, ".git/HEAD")
+    logger.info("[-] Testing %s", head_url)
+    try:
+        response = session.get(head_url, timeout=timeout, allow_redirects=False)
+    except Exception:
+        logger.exception("Error accessing %s", head_url)
+        return 1
+    logger.info("[%d]", response.status_code)
     valid, error_message = verify_response(response)
     if not valid:
-        printf(error_message, url, "/.git/HEAD", file=sys.stderr)
+        logger.error(error_message)
         return 1
     elif not re.match(r"^(ref:.*|[0-9a-f]{40}$)", response.text.strip()):
-        printf(
-            "error: %s/.git/HEAD is not a git HEAD file\n",
-            url,
-            file=sys.stderr,
-        )
+        logger.error("error: %s/.git/HEAD is not a valid git HEAD file", url)
         return 1
 
-    # set up environment to ensure proxy usage
     environment = os.environ.copy()
     configured_proxy = socks.getdefaultproxy()
     if configured_proxy is not None:
         proxy_types = ["http", "socks4h", "socks5h"]
-        environment["ALL_PROXY"] = f"http.proxy={proxy_types[configured_proxy[0]]}://{configured_proxy[1]}:{configured_proxy[2]}"
+        environment["ALL_PROXY"] = "http.proxy={}:{}:{}".format(
+            proxy_types[configured_proxy[0]], configured_proxy[1], configured_proxy[2]
+        )
 
-    # check for directory listing
-    printf("[-] Testing %s/.git/ ", url)
-    response = session.get("%s/.git/" % url, allow_redirects=False)
-    printf("[%d]\n", response.status_code)
+    gitdir = join_url(url, ".git/")
+    logger.info("[-] Testing %s", gitdir)
+    try:
+        response = session.get(gitdir, allow_redirects=False)
+    except Exception:
+        logger.exception("Error accessing %s", gitdir)
+        return 1
+    logger.info("[%d]", response.status_code)
 
-
-    if (
-        response.status_code == 200
-        and is_html(response)
-        and "HEAD" in get_indexed_files(response)
-    ):
-        printf("[-] Fetching .git recursively\n")
+    if (response.status_code == 200 and is_html(response) and "HEAD" in get_indexed_files(response)):
+        logger.info("[-] Fetching .git recursively")
         process_tasks(
             [".git/", ".gitignore"],
             RecursiveDownloadWorker,
             jobs,
             args=(url, directory, retry, timeout, http_headers),
         )
-        
-        os.chdir(directory)
-
-        printf("[-] Sanitizing .git/config\n")
-        sanitize_file(".git/config")
-
-        printf("[-] Running git checkout .\n")
-        subprocess.check_call(["git", "checkout", "."], env=environment)
+        logger.info("[-] Sanitizing .git/config")
+        sanitize_file(os.path.join(directory, ".git", "config"))
+        try:
+            logger.info("[-] Running git checkout .")
+            subprocess.check_call(["git", "checkout", "."], cwd=directory, env=environment)
+        except subprocess.CalledProcessError:
+            logger.error("git checkout failed")
         return 0
 
-    # no directory listing
-    printf("[-] Fetching common files\n")
+    # No directory listing – fetch common files.
+    logger.info("[-] Fetching common files")
     tasks = [
         ".gitignore",
         ".git/COMMIT_EDITMSG",
@@ -525,8 +412,8 @@ def fetch_git(url, directory, jobs, retry, timeout, http_headers, client_cert_p1
         args=(url, directory, retry, timeout, http_headers, client_cert_p12, client_cert_p12_password),
     )
 
-    # find refs
-    printf("[-] Finding refs/\n")
+    # Find refs.
+    logger.info("[-] Finding refs/")
     tasks = [
         ".git/FETCH_HEAD",
         ".git/HEAD",
@@ -570,7 +457,6 @@ def fetch_git(url, directory, jobs, retry, timeout, http_headers, client_cert_p1
         ".git/refs/wip/index/refs/heads/production",
         ".git/refs/wip/index/refs/heads/development"
     ]
-
     process_tasks(
         tasks,
         FindRefsWorker,
@@ -578,22 +464,18 @@ def fetch_git(url, directory, jobs, retry, timeout, http_headers, client_cert_p1
         args=(url, directory, retry, timeout, http_headers, client_cert_p12, client_cert_p12_password),
     )
 
-    # find packs
-    printf("[-] Finding packs\n")
+    logger.info("[-] Finding packs")
     tasks = []
-
-    # use .git/objects/info/packs to find packs
-    info_packs_path = os.path.join(
-        directory, ".git", "objects", "info", "packs"
-    )
+    info_packs_path = os.path.join(directory, ".git", "objects", "info", "packs")
     if os.path.exists(info_packs_path):
-        with open(info_packs_path, "r") as f:
-            info_packs = f.read()
-
-        for sha1 in re.findall(r"pack-([a-f0-9]{40})\.pack", info_packs):
-            tasks.append(".git/objects/pack/pack-%s.idx" % sha1)
-            tasks.append(".git/objects/pack/pack-%s.pack" % sha1)
-
+        try:
+            with open(info_packs_path, "r") as f:
+                info_packs = f.read()
+            for sha1 in re.findall(r"pack-([a-f0-9]{40})\.pack", info_packs):
+                tasks.append(".git/objects/pack/pack-{}.idx".format(sha1))
+                tasks.append(".git/objects/pack/pack-{}.pack".format(sha1))
+        except Exception:
+            logger.exception("Error processing %s", info_packs_path)
     process_tasks(
         tasks,
         DownloadWorker,
@@ -601,220 +483,173 @@ def fetch_git(url, directory, jobs, retry, timeout, http_headers, client_cert_p1
         args=(url, directory, retry, timeout, http_headers, client_cert_p12, client_cert_p12_password),
     )
 
-    # find objects
-    printf("[-] Finding objects\n")
+    # Find objects.
+    logger.info("[-] Finding objects")
     objs = set()
     packed_objs = set()
-
-    # .git/packed-refs, .git/info/refs, .git/refs/*, .git/logs/*
     files = [
         os.path.join(directory, ".git", "packed-refs"),
         os.path.join(directory, ".git", "info", "refs"),
         os.path.join(directory, ".git", "FETCH_HEAD"),
         os.path.join(directory, ".git", "ORIG_HEAD"),
     ]
-    for dirpath, _, filenames in os.walk(
-        os.path.join(directory, ".git", "refs")
-    ):
+    for dirpath, _, filenames in os.walk(os.path.join(directory, ".git", "refs")):
         for filename in filenames:
             files.append(os.path.join(dirpath, filename))
-    for dirpath, _, filenames in os.walk(
-        os.path.join(directory, ".git", "logs")
-    ):
+    for dirpath, _, filenames in os.walk(os.path.join(directory, ".git", "logs")):
         for filename in filenames:
             files.append(os.path.join(dirpath, filename))
-
     for filepath in files:
         if not os.path.exists(filepath):
             continue
-
-        with open(filepath, "r") as f:
-            content = f.read()
-
-        for obj in re.findall(r"(^|\s)([a-f0-9]{40})($|\s)", content):
-            obj = obj[1]
-            objs.add(obj)
-
-    # use .git/index to find objects
+        try:
+            with open(filepath, "r") as f:
+                content = f.read()
+            for obj in re.findall(r"(^|\s)([a-f0-9]{40})($|\s)", content):
+                objs.add(obj[1])
+        except Exception:
+            logger.exception("Error reading %s", filepath)
     index_path = os.path.join(directory, ".git", "index")
     if os.path.exists(index_path):
-        index = dulwich.index.Index(index_path)
-
-        for entry in index.iterobjects():
-            objs.add(entry[1].decode())
-
-    # use packs to find more objects to fetch, and objects that are packed
+        try:
+            index = dulwich.index.Index(index_path)
+            for entry in index.iterobjects():
+                objs.add(entry[1].decode())
+        except Exception:
+            logger.exception("Error reading index %s", index_path)
     pack_file_dir = os.path.join(directory, ".git", "objects", "pack")
     if os.path.isdir(pack_file_dir):
         for filename in os.listdir(pack_file_dir):
             if filename.startswith("pack-") and filename.endswith(".pack"):
                 pack_data_path = os.path.join(pack_file_dir, filename)
-                pack_idx_path = os.path.join(
-                    pack_file_dir, filename[:-5] + ".idx"
-                )
-                pack_data = dulwich.pack.PackData(pack_data_path)
-                pack_idx = dulwich.pack.load_pack_index(pack_idx_path)
-                pack = dulwich.pack.Pack.from_objects(pack_data, pack_idx)
-
-                for obj_file in pack.iterobjects():
-                    packed_objs.add(obj_file.sha().hexdigest())
-                    objs |= set(get_referenced_sha1(obj_file))
-
-    # fetch all objects
-    printf("[-] Fetching objects\n")
+                pack_idx_path = os.path.join(pack_file_dir, filename[:-5] + ".idx")
+                try:
+                    pack_data = dulwich.pack.PackData(pack_data_path)
+                    pack_idx = dulwich.pack.load_pack_index(pack_idx_path)
+                    pack = dulwich.pack.Pack.from_objects(pack_data, pack_idx)
+                    for obj_file in pack.iterobjects():
+                        packed_objs.add(obj_file.sha().hexdigest())
+                        objs |= set(get_referenced_sha1(obj_file))
+                except Exception:
+                    logger.exception("Error processing pack file %s", filename)
+    logger.info("[-] Fetching objects")
     process_tasks(
         objs,
         FindObjectsWorker,
         jobs,
         args=(url, directory, retry, timeout, http_headers, client_cert_p12, client_cert_p12_password),
-        tasks_done=packed_objs,
+        tasks_done_set=packed_objs,
     )
-
-    # git checkout
-    printf("[-] Running git checkout .\n")
-    os.chdir(directory)
-    sanitize_file(".git/config")
-
-    # ignore errors
-    subprocess.call(
-        ["git", "checkout", "."], 
-        stderr=open(os.devnull, "wb"),
-        env=environment
-    )
-
+    logger.info("[-] Running git checkout .")
+    sanitize_file(os.path.join(directory, ".git", "config"))
+    try:
+        subprocess.call(["git", "checkout", "."], cwd=directory,
+                        stderr=open(os.devnull, "wb"), env=environment)
+    except Exception:
+        logger.exception("Error running git checkout")
     return 0
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        usage="git-dumper [options] URL DIR",
-        description="Dump a git repository from a website.",
-    )
-    parser.add_argument("url", metavar="URL", help="url")
-    parser.add_argument("directory", metavar="DIR", help="output directory")
-    parser.add_argument("--proxy", help="use the specified proxy")
-    parser.add_argument("--client-cert-p12", help="client certificate in PKCS#12")
-    parser.add_argument("--client-cert-p12-password", help="password for the client certificate")
-    parser.add_argument(
-        "-j",
-        "--jobs",
-        type=int,
-        default=10,
-        help="number of simultaneous requests",
-    )
-    parser.add_argument(
-        "-r",
-        "--retry",
-        type=int,
-        default=3,
-        help="number of request attempts before giving up",
-    )
-    parser.add_argument(
-        "-t",
-        "--timeout",
-        type=int,
-        default=3,
-        help="maximum time in seconds before giving up",
-    )
-    parser.add_argument(
-        "-u",
-        "--user-agent",
-        type=str,
-        default="Mozilla/5.0 (Windows NT 10.0; rv:78.0) Gecko/20100101 Firefox/78.0",
-        help="user-agent to use for requests",
-    )
-    parser.add_argument(
-        "-H",
-        "--header",
-        type=str,
-        action="append",
-        help="additional http headers, e.g `NAME=VALUE`",
-    )
-    args = parser.parse_args()
+intents = discord.Intents.default()
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-    # jobs
-    if args.jobs < 1:
-        parser.error("invalid number of jobs, got `%d`" % args.jobs)
+@bot.tree.command(name="gitdump", description="dump a git repository given a url, assuming said platform has it.")
+async def gitdump(
+    interaction: discord.Interaction,
+    url: str,
+    jobs: int = 10,
+    retry: int = 3,
+    timeout: int = 3,
+    user_agent: str = "Mozilla/5.0 (Windows NT 10.0; rv:78.0) Gecko/20100101 Firefox/78.0",
+    header: str = None,
+    proxy: str = None,
+    client_cert_p12: str = None,
+    client_cert_p12_password: str = None
+):
+    embed = discord.Embed(title="dumping .git...", description="please wait while the repository is being dumped.", color=0x00FF00)
+    await interaction.response.send_message(embed=embed, ephemeral=False)
 
-    # retry
-    if args.retry < 1:
-        parser.error("invalid number of retries, got `%d`" % args.retry)
-
-    # timeout
-    if args.timeout < 1:
-        parser.error("invalid timeout, got `%d`" % args.timeout)
-
-    # header
-    http_headers = {"User-Agent": args.user_agent}
-    if args.header:
-        for header in args.header:
-            tokens = header.split("=", maxsplit=1)
-            if len(tokens) != 2:
-                parser.error(
-                    "http header must have the form NAME=VALUE, got `%s`"
-                    % header
-                )
-            name, value = tokens
+    http_headers = {"User-Agent": user_agent}
+    if header:
+        try:
+            name, value = header.split("=", 1)
             http_headers[name.strip()] = value.strip()
+        except Exception:
+            pass
 
-    # proxy
-    if args.proxy:
+    if proxy:
         proxy_valid = False
-
         for pattern, proxy_type in [
             (r"^socks5:(.*):(\d+)$", socks.PROXY_TYPE_SOCKS5),
             (r"^socks4:(.*):(\d+)$", socks.PROXY_TYPE_SOCKS4),
             (r"^http://(.*):(\d+)$", socks.PROXY_TYPE_HTTP),
             (r"^(.*):(\d+)$", socks.PROXY_TYPE_SOCKS5),
         ]:
-            m = re.match(pattern, args.proxy)
+            m = re.match(pattern, proxy)
             if m:
                 socks.setdefaultproxy(proxy_type, m.group(1), int(m.group(2)))
                 socket.socket = socks.socksocket
                 proxy_valid = True
+                logger.debug("Proxy set to %s", proxy)
                 break
-
         if not proxy_valid:
-            parser.error("invalid proxy, got `%s`" % args.proxy)
+            await interaction.followup.send("proxies a bit cooked")
+            return
 
-    # output directory
-    if not os.path.exists(args.directory):
-        os.makedirs(args.directory)
+    if url.rstrip("/").endswith(".git"):
+        url = url.rstrip("/")[:-4]
+    url = url.rstrip("/")
 
-    if not os.path.isdir(args.directory):
-        parser.error("`%s` is not a directory" % args.directory)
+    tempdir = tempfile.mkdtemp(prefix="gitdump_")
+    logger.info("dumping into temporary directory: %s", tempdir)
 
-    # client certificate
-    if args.client_cert_p12:
-        if not os.path.exists(args.client_cert_p12):
-            parser.error(
-                "client certificate `%s` does not exist" % args.client_cert_p12
-            )
+    try:
+        result = await asyncio.to_thread(fetch_git, url, tempdir, jobs, retry, timeout, http_headers, client_cert_p12, client_cert_p12_password)
+    except Exception as e:
+        logger.exception("Error during git dump")
+        await interaction.followup.send("error occurred mid-dump.")
+        shutil.rmtree(tempdir)
+        return
 
-        if not os.path.isfile(args.client_cert_p12):
-            parser.error(
-                "client certificate `%s` is not a file" % args.client_cert_p12
-            )
+    if result != 0:
+        await interaction.followup.send("error dumping the repository.")
+        shutil.rmtree(tempdir)
+        return
 
-        if args.client_cert_p12_password is None:
-            parser.error("client certificate password is required")
+    zippath = tempdir + ".zip"
+    try:
+        with zipfile.ZipFile(zippath, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for root, _, files in os.walk(tempdir):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    arcname = os.path.relpath(file_path, start=tempdir)
+                    zipf.write(file_path, arcname)
+    except Exception:
+        logger.exception("error zipping the dump")
+        await interaction.followup.send("error creating zip file.")
+        shutil.rmtree(tempdir)
+        return
 
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-    # fetch everything
-    sys.exit(
-        fetch_git(
-            args.url,
-            args.directory,
-            args.jobs,
-            args.retry,
-            args.timeout,
-            http_headers,
-            args.client_cert_p12,
-            args.client_cert_p12_password
-        )
-    )
-
+    try:
+        await interaction.followup.send(content="dump complete", file=discord.File(zippath, filename="out.zip"))
+    except Exception:
+        logger.exception("error sending zip file")
+        await interaction.followup.send("error sending zip file.")
+    finally:
+        shutil.rmtree(tempdir)
+        os.remove(zippath)
 
 if __name__ == "__main__":
-    main()
+    TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+    if not TOKEN:
+        logger.error("errrm wtf.")
+        sys.exit(1)
+    async def main():
+        await bot.wait_until_ready()
+        try:
+            synced = await bot.tree.sync()
+            logger.info("Synced %d commands", len(synced))
+        except Exception:
+            logger.exception("err syncing commands")
+    bot.loop.create_task(main())
+    bot.run(TOKEN)
